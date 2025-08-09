@@ -166,6 +166,39 @@ impl Running {
         }
         *peers = retained_peers;
     }
+
+    /// Extract and propagate token/headers from the MCP request to upstream servers
+    fn extract_headers(&self, context: &RequestContext<RoleServer>) -> HeaderMap {
+        let mut headers = self.headers.clone();
+
+        // Optionally extract the validated token and propagate it to upstream servers
+        // if found
+        if let Some(axum_parts) = context.extensions.get::<axum::http::request::Parts>()
+            && let Some(token) = axum_parts.extensions.get::<ValidToken>()
+        {
+            headers.typed_insert(token.deref().clone());
+        }
+
+        // Extract specific headers from the original HTTP request
+        if let Some(axum_parts) = context.extensions.get::<axum::http::request::Parts>() {
+            for (header_name, header_value) in &axum_parts.headers {
+                let name_str = header_name.as_str().to_lowercase();
+
+                // Only propagate specific headers
+                if name_str == "x-access-token" || name_str == "x-user-id" {
+                    if let Ok(value) = header_value.to_str() {
+                        if let Ok(name) = reqwest::header::HeaderName::from_bytes(header_name.as_str().as_bytes()) {
+                            if let Ok(val) = reqwest::header::HeaderValue::from_str(value) {
+                                headers.insert(name, val);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        headers
+    }
 }
 
 impl ServerHandler for Running {
@@ -208,13 +241,15 @@ impl ServerHandler for Running {
                     .await
             }
             EXECUTE_TOOL_NAME => {
+                let headers = self.extract_headers(&context);
+
                 self.execute_tool
                     .as_ref()
                     .ok_or(tool_not_found(&request.name))?
                     .execute(graphql::Request {
                         input: Value::from(request.arguments.clone()),
                         endpoint: &self.endpoint,
-                        headers: self.headers.clone(),
+                        headers,
                     })
                     .await
             }
@@ -226,14 +261,7 @@ impl ServerHandler for Running {
                     .await
             }
             _ => {
-                // Optionally extract the validated token and propagate it to upstream servers
-                // if found
-                let mut headers = self.headers.clone();
-                if let Some(axum_parts) = context.extensions.get::<axum::http::request::Parts>()
-                    && let Some(token) = axum_parts.extensions.get::<ValidToken>()
-                {
-                    headers.typed_insert(token.deref().clone());
-                }
+                let headers = self.extract_headers(&context);
 
                 let graphql_request = graphql::Request {
                     input: Value::from(request.arguments.clone()),
